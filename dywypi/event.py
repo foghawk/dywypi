@@ -6,6 +6,9 @@ as such in its name.
 """
 from dywypi.state import Channel, Peer
 
+import logging
+logger = logging.getLogger(__name__)
+
 class Event:
     """Something happened."""
     def __init__(self, client, raw_message):
@@ -57,3 +60,13 @@ class _MessageMixin:
 
 class Message(Event, _MessageMixin):
     pass
+
+
+class DirectMessage(Event):
+    def __init__(self, client, raw_message):
+        logger.debug('making a direct message...')
+        super().__init__(client, raw_message)
+
+    @property
+    def message(self):
+        return self.raw_message

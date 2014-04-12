@@ -4,7 +4,7 @@ import importlib
 import logging
 import pkgutil
 
-from dywypi.event import Event, Message, _MessageMixin
+from dywypi.event import Event, Message, _MessageMixin, DirectMessage
 
 log = logging.getLogger(__name__)
 
@@ -26,8 +26,8 @@ class EventWrapper:
 
     # TODO should this just be on Event?
     @asyncio.coroutine
-    def reply(self, message):
-        if self.event.channel:
+    def reply(self, message, private=False, no_respond=False):
+        if self.event.channel and not private:
             reply_to = self.event.channel.name
         else:
             reply_to = self.event.source.name
@@ -39,7 +39,7 @@ class EventWrapper:
         if isinstance(message, FormattedString):
             # TODO this should probably be a method on the dialect actually...?
             message = message.render(self.event.client.format_transition)
-        yield from self.event.client.say(reply_to, message)
+        yield from self.event.client.say(reply_to, message, no_respond)
 
     def __getattr__(self, attr):
         return getattr(self.event, attr)
@@ -143,6 +143,9 @@ class PluginManager:
         plugin.fire_command(wrapped, is_global=False)
 
     def fire(self, event):
+        if isinstance(event, DirectMessage):
+            log.debug("firing a direct message...")
+
         self._fire(event)
 
         # Possibly also fire plugin-specific events.

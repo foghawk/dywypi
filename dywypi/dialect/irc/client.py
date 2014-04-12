@@ -316,11 +316,12 @@ class IRCClient:
     # TODO should this be part of the general client interface, or should there
     # be a separate thing that smooths out the details?
     @asyncio.coroutine
-    def say(self, target, message):
+    def say(self, target, message, notice=False):
         """Coroutine that sends a message to a target, which may be either a
         `Channel` or a `Peer`.
         """
-        yield from self.send_message('PRIVMSG', target, message)
+        command = 'NOTICE' if notice else 'PRIVMSG'
+        yield from self.send_message(command, target, message)
 
     def join(self, channel_name, key=None):
         """Coroutine that joins a channel, and nonblocks until the join is

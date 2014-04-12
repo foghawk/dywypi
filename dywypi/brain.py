@@ -4,6 +4,7 @@ from concurrent.futures import FIRST_COMPLETED
 from functools import partial
 import logging
 from urllib.parse import urlparse
+import re
 
 from dywypi.dialect.irc.client import IRCClient
 from dywypi.plugin import PluginManager
@@ -144,6 +145,9 @@ class Brain:
             # TODO import down here in case no urwid
             from dywypi.dialect.shell import ShellClient
             client_class = ShellClient
+        elif uri.scheme in ('dcc',):
+            from dywypi.dialect.dcc import DCCClient
+            client_class = DCCClient
         else:
             raise ValueError(
                 "Don't know how to handle protocol {}: {}"

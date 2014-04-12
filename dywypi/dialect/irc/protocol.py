@@ -128,6 +128,8 @@ class IRCMessage:
         \Z''',
         flags=re.VERBOSE)
 
+    CTCP = re.compile('^\x01(.*)\x01$')
+
     @classmethod
     def parse(cls, string):
         """Parse an IRC message.  DOES NOT expect to receive the trailing
@@ -137,6 +139,9 @@ class IRCMessage:
         if not m:
             raise ValueError(repr(string))
 
+        c_chk = (m.group('command') in ['PRIVMSG', 'NOTICE']) and cls.CTCP.match(m.group('trailing'))
+        c_fix = 'ctcp-' if c_chk else ''
+
         argstr = m.group('args').lstrip(' ')
         if argstr:
             args = re.split(' +', argstr)
@@ -144,7 +149,7 @@ class IRCMessage:
             args = []
 
         if m.group('trailing'):
-            args.append(m.group('trailing'))
+            args.append(c_fix+m.group('trailing').strip('\x01'))
 
         return cls(m.group('command'), *args, prefix=m.group('prefix'))
 

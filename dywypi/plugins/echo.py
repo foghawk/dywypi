@@ -6,8 +6,8 @@ plugin = Plugin('echo')
 
 @plugin.on(Message)
 def echo(event):
-    if event.channel != '#dywypi':
-        return
+    #if event.channel != '#dywypi':
+    #    return
 
     if not event.message.startswith("echo: "):
         return
