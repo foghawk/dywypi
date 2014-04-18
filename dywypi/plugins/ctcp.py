@@ -32,8 +32,11 @@ def dcc(event):
 		net = Network(std_ip)
 		net.add_server(std_ip, int(event.args[3]))
 		dcc_client = DCCClient(event.loop, net)
-		yield from dcc_client.connect()
-		yield from dcc_client.send_message("hello!")
+		try:
+			yield from dcc_client.connect()
+			yield from dcc_client.send_message("hello!")
+		except TimeoutError:
+			yield from event.reply("Sorry, it looks like I can't open a direct chat connection. This could be because of settings on your IRC client, firewall, router, and/or proxy.")
 
 @plugin.on(DirectMessage)
 def dcc_echo(event):
