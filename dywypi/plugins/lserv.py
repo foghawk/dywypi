@@ -1,21 +1,20 @@
 from dywypi.plugin import Plugin, PublicMessage
-from dywypi.state import Peer
 
 import os
 import re
 import logging
 
-plugin = Plugin('lserv')
+plugin = Plugin('lserv', '@')
 
 logger = logging.getLogger(__name__)
 
 PATH = u"INSERT_TEST_PATH_HERE" #make sure this takes unicode
 
-fs = []
+fs = {}
 if os.path.isdir(PATH):
-	for rootpath, dirs, files in os.walk(PATH):
+	for rootpath, dirs, files in os.walk(os.path.abspath(PATH)):
 		for name in files:
-			fs.append((rootpath, name))
+			fs[os.path.basename(name)] = os.path.join(rootpath, name)
 			#progress indicator? filetype filter?
 			#TODO write to file--better caching, allows download of list (required). reserve filename?
 			#can i load from dir, then start serving while writing? should be able to, duh async
@@ -24,12 +23,12 @@ elif os.path.isfile(PATH):
 	l = open(PATH)
 	for line in l:
 		if os.path.isfile(line):
-			fs.append(os.path.split(line))
+			fs[os.path.basename(line)] = line
 		else:
 			logger.warning('"{0}" is not a valid file and will not be served.'.format(line))
 			#TODO smarter error checking (don't log a million warnings if one external drive is missing)
 else:
-	logger.error('List path not found')
+	logger.error('List path not found; nothing will be served!')
 
 
 
@@ -46,20 +45,21 @@ def prettysize(b):
 		b /= 1024.0
 	return '{0:.2f} TB'.format(b)
 
-@plugin.on(PublicMessage) #boo this is hacky
-def public_find(event):
-	if event.message[0:5] == '@find':
-		logger.debug('Ready to fire @find command...')
-		event.client.say(Peer(event.client.nick, None, None), event.message) #this doesn't work idkoc why rn
-
-@plugin.command('@find')
+@plugin.command('find')
 def find(event):
-	results = [f for f in fs if and_search(event.args, f[1])]
+	results = {f: fs[f] for f in fs if and_search(event.args, f)}
 	if len(results) == 0 and not event.channel:
 		yield from event.reply("Sorry, nothing found for '{0}'.".format(event.message[6:]))
 	for r in results:
-		yield from event.reply("{0} ({1})".format(r[1], prettysize(os.path.getsize(os.path.join(r[0], r[1])))), private=True)
+		yield from event.reply("{0} ({1})".format(r, prettysize(os.path.getsize(os.path.join(r, results[r])))), private=True)
 
-#@plugin.command('!'+event.client.nick) #download list (no args) or file (args)
 
+@plugin.on(PublicMessage)
+def send(event):
+	if event.message == '@'+event.client.nick: #can't implement as command; no access to nick w/o event :\
+		pass #send list
+	elif event.message.startswith('!'+event.client.nick):
+		request = fs[event.message[len(event.client.nick)+2:]]
+		logger.debug('Ready to serve file at '+request)
+		#send file. require ctcp/dcc plugin; that works, right?
 

@@ -40,6 +40,6 @@ def dcc(event):
 
 @plugin.on(DirectMessage)
 def dcc_echo(event):
-	logger.debug("got a direct message!")
+	logger.debug("got a direct message!") #no
 	logger.debug("it's '" +event.message+ "'")
 	yield from event.client.say(event.message)

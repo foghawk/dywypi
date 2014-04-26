@@ -71,12 +71,17 @@ class Command(PluginEvent, _MessageMixin):
 class PluginManager:
     def __init__(self):
         self.loaded_plugins = {}
+        self.loaded_prefixes = {}
         self.plugin_data = defaultdict(dict)
 
     @property
     def known_plugins(self):
         """Returns a dict mapping names to all known `Plugin` instances."""
         return BasePlugin._known_plugins
+
+    @property
+    def known_prefixes(self):
+        return {p.prefix: p.name for p in self.known_plugins.values() if p.prefix}
 
     def scan_package(self, package='dywypi.plugins'):
         """Scans a Python package for in-process Python plugins."""
@@ -102,6 +107,7 @@ class PluginManager:
         plugin.start()
         log.info("Loaded plugin {}".format(plugin.name))
         self.loaded_plugins[plugin.name] = plugin
+        if (plugin.prefix): self.loaded_prefixes[plugin.prefix] = plugin.name
 
     def loadmodule(self, modname):
         # This is a little chumptastic, but: figure out which plugins a module
@@ -127,8 +133,9 @@ class PluginManager:
         # TODO well this could be slightly more efficient
         # TODO should also mention when no command exists
         for plugin in self.loaded_plugins.values():
-            wrapped = self._wrap_event(command_event, plugin)
-            plugin.fire_command(wrapped, is_global=True)
+            if not plugin.prefix:
+                wrapped = self._wrap_event(command_event, plugin)
+                plugin.fire_command(wrapped, is_global=True)
 
     def _fire_plugin_command(self, plugin_name, command_event):
         # TODO should DEFINITELY complain when plugin OR command doesn't exist
@@ -153,21 +160,27 @@ class PluginManager:
             # Messages get broken down a little further.
             is_public = (event.channel)
             is_command = (event.message.startswith(event.client.nick) and
-                event.message[len(event.client.nick)] in ':, ')
+                (event.message != event.client.nick and
+                event.message[len(event.client.nick)] in ':, '))
 
-            if is_command or not is_public:
+            if is_command or not is_public or event.message.startswith(tuple(self.loaded_prefixes)):
                 # Something addressed directly to us; this is a command and
                 # needs special handling!
                 if is_command:
-                    message = event.message[len(event.client.nick) + 1:]
+                    message = event.message[len(event.client.nick) + 1:].strip()
                 else:
                     message = event.message
+                plugin_name = None
+                for prefix in self.loaded_prefixes: #ugh
+                    if message.startswith(prefix):
+                        plugin_name = self.loaded_prefixes[prefix]
+                        message = message[len(prefix):]
+                        break #ew 
                 try:
                     command_name, argstr = message.split(None, 1)
                 except ValueError:
                     command_name, argstr = message.strip(), ''
 
-                plugin_name, _, command_name = command_name.rpartition('.')
                 command_event = Command.from_event(
                     event,
                     command_name=command_name,
@@ -196,7 +209,7 @@ class BasePlugin:
     _known_plugins = {}
 
     def __init__(self, name):
-        if name in self._known_plugins:
+        if name in self._known_plugins: # TODO check for prefix collision too
             raise NameError(
                 "Can't have two plugins named {}: {} versus {}"
                 .format(
@@ -209,9 +222,10 @@ class BasePlugin:
 
 
 class Plugin(BasePlugin):
-    def __init__(self, name):
+    def __init__(self, name, prefix=None):
         self.listeners = defaultdict(list)
         self.commands = {}
+        self.prefix = prefix
 
         super().__init__(name)
 
@@ -249,10 +263,11 @@ class Plugin(BasePlugin):
     def fire_command(self, event, *, is_global):
         if event.command_name in self.commands:
             command = self.commands[event.command_name]
-            # Don't execute if the command is local-only and this wasn't
-            # invoked with a prefix
-            if command.is_global or not is_global:
-                asyncio.async(command.coro(event), loop=event.loop)
+            # # Don't execute if the command is local-only and this wasn't
+            # # invoked with a prefix
+            # lol nope this happens in the parser now
+            #if command.is_global or not is_global:
+            asyncio.async(command.coro(event), loop=event.loop)
 
     def start(self):
         # TODO need an onload hook or something?

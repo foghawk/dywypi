@@ -83,24 +83,27 @@ class DCCClient:
 
         #check for connection? how tho
 
-        asyncio.async(self._advance(), loop = self.loop)
+        asyncio.async(self._advance(), loop=self.loop)
 
     def disconnect(self):
         self.proto.transport.close()
 
     @asyncio.coroutine
     def _advance(self):
+        logger.debug('advancing...') #yes
         yield from self._read_message()
         asyncio.async(self._advance(), loop=self.loop)
 
     @asyncio.coroutine
     def _read_message(self):
+         logger.debug('reading message...') #yes
          message = yield from self.proto.read_message()
          event = DirectMessage(self, message)
          self.event_queue.put_nowait(event)
 
     @asyncio.coroutine
     def read_event(self):
+        logger.debug('reading an event...') #no
         return(yield from self.event_queue.get())
 
     @asyncio.coroutine

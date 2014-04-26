@@ -15,6 +15,7 @@ class Event:
         self.client = client
         self.loop = client.loop
         self.raw_message = raw_message
+        if isinstance(self, DirectMessage): logger.debug('direct message is now an event...') #yes
 
     @classmethod
     def from_event(cls, event, *args, **kwargs):
@@ -64,7 +65,7 @@ class Message(Event, _MessageMixin):
 
 class DirectMessage(Event):
     def __init__(self, client, raw_message):
-        logger.debug('making a direct message...')
+        logger.debug('making a direct message...') #yes
         super().__init__(client, raw_message)
 
     @property
