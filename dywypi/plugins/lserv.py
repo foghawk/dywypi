@@ -1,6 +1,6 @@
 from dywypi.plugin import Plugin, PublicMessage
 
-import os
+from pathlib import Path
 import re
 import logging
 
@@ -25,22 +25,21 @@ def safe_add(d, k, v, msg):
         logger.warning(msg.format(v, d[k]))
 
 fs = {}
-if os.path.isdir(PATH):
-    for rootpath, dirs, files in os.walk(os.path.abspath(PATH)):
-        for name in files:
-            if tf.match(name):
-                safe_add(fs, name, os.path.join(rootpath, name),
-                    '"{0}" collides with file "{1}" and will not be served.')
-            #progress indicator?
-            #TODO write to file--better caching, allows download of list (required). reserve filename?
-            #can i load from dir, then start serving while writing? should be able to, duh async
-            #TODO one bot serving multiple lists
-elif os.path.isfile(PATH):
-    l = open(PATH)
+lp = Path(PATH)
+if lp.is_dir():
+    for p in lp.glob('**/*'):
+        if tf.match(p.name):
+            safe_add(fs, p.name, p, '"{0}" collides with file "{1}" and will not be served.')
+        #progress indicator?
+        #TODO write to file--better caching, allows download of list (required). reserve filename?
+        #can i load from dir, then start serving while writing? should be able to, duh async
+        #TODO one bot serving multiple lists
+elif lp.is_file():
+    l = lp.open()
     for line in l:
-        if os.path.isfile(line) and tf.match(os.path.basename(line)):
-            safe_add(fs, os.path.basename(line), line,
-                '"{0}" collides with file "{1}" and will not be served.')
+        p = Path(line)
+        if p.is_file() and tf.match(p.name):
+            safe_add(fs, p.name, p, '"{0}" collides with file "{1}" and will not be served.')
         else:
             logger.warning('"{0}" is not a valid file and will not be served.'.format(line))
             #TODO smarter error checking (don't log a million warnings if one external drive is missing)
@@ -66,7 +65,7 @@ def find(event):
     if len(results) == 0 and not event.channel:
         yield from event.reply("Sorry, nothing found for '{0}'.".format(event.message[6:]))
     for r in results:
-        yield from event.reply("{0} ({1})".format(r, prettysize(os.path.getsize(os.path.join(r, results[r])))), private=True)
+        yield from event.reply("{0} ({1})".format(r, prettysize(results[r].stat().st_size)), private=True)
 
 @plugin.on(PublicMessage)
 def send(event):
@@ -74,6 +73,6 @@ def send(event):
         pass #send list
     elif event.message.startswith('!'+event.client.nick):
         request = fs[event.message[len(event.client.nick)+2:]]
-        logger.debug('Ready to serve file at '+request)
+        logger.debug('Ready to serve file at '+str(request))
         #send file. require ctcp/dcc plugin; that works, right?
 

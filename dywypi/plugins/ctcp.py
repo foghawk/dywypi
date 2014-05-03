@@ -29,7 +29,7 @@ def time(event):
 def dcc(event):
     if event.args[0] == 'CHAT':
         std_ip = str(ipaddress.ip_address(int(event.args[2])))
-        net = Network(std_ip)
+        net = Network(std_ip) #event loop DOES NOT WORK because Brain does not have a reference to this network. how to give it one?
         net.add_server(std_ip, int(event.args[3]))
         dcc_client = DCCClient(event.loop, net)
         try:

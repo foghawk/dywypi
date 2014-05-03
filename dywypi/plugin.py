@@ -39,7 +39,7 @@ class EventWrapper:
         if isinstance(message, FormattedString):
             # TODO this should probably be a method on the dialect actually...?
             message = message.render(self.event.client.format_transition)
-        yield from self.event.client.say(reply_to, message, no_respond)
+        yield from self.event.client.say(message, reply_to, no_respond)
 
     def __getattr__(self, attr):
         return getattr(self.event, attr)

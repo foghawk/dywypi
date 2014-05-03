@@ -100,14 +100,15 @@ class DCCClient:
          message = yield from self.proto.read_message()
          event = DirectMessage(self, message)
          self.event_queue.put_nowait(event)
+         logger.debug(self.event_queue)
 
     @asyncio.coroutine
     def read_event(self):
         logger.debug('reading an event...') #no
-        return(yield from self.event_queue.get())
+        return (yield from self.event_queue.get())
 
     @asyncio.coroutine
-    def say(self, message):
+    def say(self, message, target=None, no_respond=None):
         yield from self.send_message(message)
 
     @asyncio.coroutine
