@@ -3,66 +3,7 @@ from asyncio.queues import Queue
 import logging
 import re
 
-logger = logging.getLogger(__name__)
-
-
-class IRCClientProtocol(asyncio.Protocol):
-    """Low-level protocol that speaks the client end of IRC.
-
-    This isn't responsible for very much besides the barest minimum definition
-    of an IRC client: connecting and responding to PING.
-
-    You probably want `read_message`, or the higher-level client class.
-    """
-    def __init__(self, loop, nick, password, charset='utf8'):
-        self.nick = nick
-        self.password = password
-        self.charset = charset
-
-        self.buf = b''
-        self.message_queue = Queue(loop=loop)
-        self.registered = False
-
-    def connection_made(self, transport):
-        self.transport = transport
-        if self.password:
-            self.send_message('PASS', self.password)
-        self.send_message('NICK', self.nick)
-        self.send_message('USER', 'dywypi', '-', '-', 'dywypi Python IRC bot')
-
-    def data_received(self, data):
-        data = self.buf + data
-        while True:
-            raw_message, delim, data = data.partition(b'\r\n')
-            if not delim:
-                # Incomplete message; stop here and wait for more
-                self.buf = raw_message
-                return
-
-            # TODO valerr
-            message = IRCMessage.parse(raw_message.decode(self.charset))
-            logger.debug("recv: %r", message)
-            self.handle_message(message)
-
-    def handle_message(self, message):
-        if message.command == 'PING':
-            self.send_message('PONG', message.args[-1])
-
-        elif message.command == 'RPL_WELCOME':
-            # 001, first thing sent after registration
-            if not self.registered:
-                self.registered = True
-
-        self.message_queue.put_nowait(message)
-
-    def send_message(self, command, *args):
-        message = IRCMessage(command, *args)
-        logger.debug("sent: %r", message)
-        self.transport.write(message.render().encode(self.charset) + b'\r\n')
-
-    @asyncio.coroutine
-    def read_message(self):
-        return (yield from self.message_queue.get())
+log = logging.getLogger(__name__)
 
 
 class IRCMessage:

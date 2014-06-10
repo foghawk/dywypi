@@ -6,8 +6,13 @@ interesting things.
 # - https://code.launchpad.net/~habnabit/+junk/urwid-protocol
 # - https://bitbucket.org/aafshar/txurwid-main/src
 
+# TODO originally all this code was intended to work with multiple shells (e.g.
+# multiple ssh clients).  it still could, but would require a bit of extra work
+# to make a fake writer.  also i'm not sure how that interacts with cbreak.
+
 import asyncio
 from asyncio.queues import Queue
+from io import BytesIO
 import logging
 import os
 import sys
@@ -15,9 +20,11 @@ import sys
 import urwid
 from urwid.raw_display import Screen
 
+from dywypi.event import Message
 from dywypi.formatting import Bold, Color, Style
+from dywypi.state import Peer
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
 class UrwidDummyInput(object):
@@ -27,9 +34,11 @@ class UrwidDummyInput(object):
     (mainly for setting cbreak).
     """
     def fileno(self):
+        # TODO this doesn't work over a network.  obviously.  need protocol
+        # support for that; telnet can do it.
         return 0
 
-# TODO was adapter
+
 class ProtocolFileAdapter(object):
     """Fake stdout.
 
@@ -40,6 +49,8 @@ class ProtocolFileAdapter(object):
         self.transport = transport
 
     def write(self, s):
+        if isinstance(s, str):
+            s = s.encode('latin1')
         self.transport.write(s)
 
     def flush(self):
@@ -51,8 +62,9 @@ class AsyncScreen(Screen):
     directly with stdin and stdout.
     """
 
-    def __init__(self, transport):
+    def __init__(self, transport, protocol):
         self.transport = transport
+        self.protocol = protocol
 
         Screen.__init__(self)
         self.colors = 256
@@ -73,18 +85,35 @@ class AsyncScreen(Screen):
         After calling this function get_input will include mouse
         click events along with keystrokes.
         """
+        # XXX FIXME
+        return
         self.transport.write(urwid.escape.MOUSE_TRACKING_ON)
 
         self._start_gpm_tracking()
 
-    # asyncio handles polling, so we don't need the loop to do it, we just push
-    # what we get to the loop from dataReceived.
     def get_input_descriptors(self):
+        # We don't really have file descriptors, only transports, so return
+        # nothing here and call MainLoop._update manually
         return []
 
-    # Do nothing here either. Not entirely sure when it gets called.
     def get_input(self, raw_keys=False):
+        # Do nothing here either.  Only used when MainLoop doesn't have an
+        # event loop, which doesn't happen here.
         return
+
+    def get_input_nonblocking(self):
+        codes = self.protocol.buf.getvalue()
+        self.protocol.buf = BytesIO()
+
+        processed_keys = []
+        original_codes = codes
+        while codes:
+            keys, codes = urwid.escape.process_keyqueue(codes, True)
+            processed_keys.extend(keys)
+
+            # TODO catch escape.MoreInputRequired?
+
+        return None, processed_keys, original_codes
 
     # Private
     def _start_gpm_tracking(self):
@@ -105,32 +134,6 @@ class AsyncScreen(Screen):
         os.kill(self.gpm_mev.pid, signal.SIGINT)
         os.waitpid(self.gpm_mev.pid, 0)
         self.gpm_mev = None
-
-
-class UrwidTerminalProtocol(asyncio.Protocol):
-    """A Protocol that passes input along from a transport into urwid's main
-    loop.
-    """
-
-    def __init__(self, bridge_factory, loop):
-        self.bridge_factory = bridge_factory
-        self.loop = loop
-
-    def connection_made(self, transport):
-        self.bridge = self.bridge_factory(self.loop, self, transport)
-        self.bridge.start()
-        self.log_handler = DywypiShellLoggingHandler(self.bridge)
-        dywypi_logger = logging.getLogger('dywypi')
-        dywypi_logger.addHandler(self.log_handler)
-        dywypi_logger.propagate = False
-        # TODO remove handler shenanigans on connection lost
-        logger.info('connection made')
-
-    def data_received(self, data):
-        """Pass keypresses along the bridge to urwid's main loop, which knows
-        how to handle them.
-        """
-        self.bridge.push_input(data)
 
 
 class AsyncioUrwidEventLoop:
@@ -189,7 +192,15 @@ class AsyncioUrwidEventLoop:
 
         Returns a handle that may be passed to remove_enter_idle()
         """
-        return self.loop.call_soon(callback)
+        # There's no such thing as "idle" in asyncio, so use a timer with an
+        # arbitrary resolution of, oh I don't know, 10fps.
+        return asyncio.async(self._idle_coro(callback), loop=self.loop)
+
+    @asyncio.coroutine
+    def _idle_coro(self, callback):
+        while True:
+            yield from asyncio.sleep(0.1, loop=self.loop)
+            callback()
 
     def remove_enter_idle(self, handle):
         """
@@ -208,6 +219,9 @@ class AsyncioUrwidEventLoop:
         if self.loop.is_running():
             # Don't try to start it again!
             self._started_loop = False
+            # TODO wait i think uh we're supposed to block here or else urwid
+            # "cleans up" immediately?
+            print('uh wait uhoh')
             return
         else:
             self._started_loop = True
@@ -244,34 +258,66 @@ class AsyncioUrwidEventLoop:
         return wrapper
 
 
-
-
 # TODO: catch ExitMainLoop somewhere
 # TODO: when urwid wants to stop, need to close the connection and kill the service AND then the reactor...
 # TODO: ctrl-c is apparently caught by twistd, not urwid?
-class AsyncUrwidBridge(object):
-    """Core of a simple bridge between asyncio and Urwid running on a local
-    terminal.  Subclass this guy.
+class UrwidProtocol(asyncio.Protocol):
+    """A Protocol that passes input along from a transport into urwid's main
+    loop.
+
+    There are several methods stubbed out here that you'll need to subclass and
+    implement.
     """
 
-    loop = None
+    def __init__(self, loop, *, writer=None):
+        self.buf = BytesIO()
 
-    def __init__(self, loop, terminal_protocol, write_transport):
-        self.terminal_protocol = terminal_protocol
+        self.loop = loop
+        # TODO this is a dumb hack because it's needlessly painful to get a
+        # bidirectional transport from a pair of existing pipes
+        self.writer = writer
+
+    ### Protocol interface
+    def connection_made(self, transport):
+        # TODO more dumb hack
+        if not self.writer:
+            self.writer = transport
 
         self.widget = self.build_toplevel_widget()
-
-        self.screen = AsyncScreen(write_transport)
-        self.loop = urwid.MainLoop(
+        self.screen = AsyncScreen(self.writer, self)
+        self.urwid_loop = urwid.MainLoop(
             self.widget,
             screen=self.screen,
-            event_loop=AsyncioUrwidEventLoop(loop),
+            event_loop=AsyncioUrwidEventLoop(self.loop),
             unhandled_input=self.unhandled_input,
             palette=self.build_palette(),
         )
 
-    def redraw(self):
-        self.loop.draw_screen()
+        self.start()
+
+        self.log_handler = DywypiShellLoggingHandler(self)
+        root_logger = logging.getLogger()
+        root_logger.addHandler(self.log_handler)
+        # TODO remove handler shenanigans on connection lost
+
+    def _loop_exception_handler(self, loop, context):
+        if context.get('exception'):
+            try:
+                log.exception(context['exception'])
+            except Exception as e:
+                import sys
+                sys.stderr.write(repr(context))
+                sys.stderr.write(repr(e))
+
+    def data_received(self, data):
+        """Pass keypresses to urwid's main loop, which knows how to handle
+        them.
+        """
+        self.buf.write(data)
+        # This is what Urwid usually schedules with watch_file, but we don't
+        # HAVE files, so call it manually
+        self.urwid_loop._update()
+        self.urwid_loop.draw_screen()
 
     # Override these guys:
 
@@ -291,30 +337,17 @@ class AsyncUrwidBridge(object):
 
     def start(self):
         self.screen.start()
-        self.loop.run()
+        # TODO it would be nice for this to work, but it expects to block on
+        # running the event loop, which obviously is a no go
+        #self.urwid_loop.run()
+
+        # Instead, we have to schedule this ourselves...
+        # TODO rather not use this hacky method in the first place
+        self.urwid_loop.event_loop.enter_idle(self.urwid_loop.entering_idle)
 
     def stop(self):
         # TODO this probably needs slightly more effort
         self.screen.stop()
-
-    # UrwidTerminalProtocol interface
-
-    def push_input(self, data):
-        """Receive data from Twisted and push it into urwid's main loop.
-        """
-        # Emulate urwid's input handling.
-        # Filter the input...
-        filtered_data = self.loop.input_filter(data, [])
-        # Let urwid do some crunching to figure out escape sequences...
-        codes = list(map(ord, filtered_data))
-        processed_keys = []
-        while codes:
-            keys, codes = urwid.escape.process_keyqueue(codes, True)
-            processed_keys.extend(keys)
-        # Send it along to the main loop...
-        self.loop.process_input(processed_keys)
-        # And redraw.
-        self.redraw()
 
 
 ### DYWYPI-SPECIFIC FROM HERE
@@ -346,16 +379,27 @@ class FancyEdit(urwid.Edit):
 urwid.register_signal(FancyEdit, ['line_submitted'])
 
 
-class DywypiShell(AsyncUrwidBridge):
+class DywypiShell(UrwidProtocol):
     """Creates a Twisted-friendly urwid app that allows interacting with dywypi
     via a shell.
     """
-    def __init__(self, *args, **kwargs):
-        #self.hub = kwargs.pop('hub')
-        super(DywypiShell, self).__init__(*args, **kwargs)
 
-        # TODO does this need to be a real object?  a real Network instance?
-        self.network = object()
+    # TODO i don't think client.nick should really be part of the exposed
+    # interface; should be a .me returning a peer probably
+    # TODO for some reason this is the client even though the thing below is
+    # actually called a Client so we should figure this the fuck out
+    nick = 'dywypi'
+
+    def __init__(self, loop, network, *args, **kwargs):
+        super().__init__(loop, **kwargs)
+
+        self.event_queue = Queue(loop=self.loop)
+
+        self.network = network
+
+        self.me = Peer('dywypi', 'dywypi', 'localhost')
+        self.you = Peer('user', 'user', 'localhost')
+
 
     def build_toplevel_widget(self):
         self.pane = UnselectableListBox(urwid.SimpleListWalker([]))
@@ -378,6 +422,9 @@ class DywypiShell(AsyncUrwidBridge):
             ('logging-warning', 'light red', 'default'),
             ('logging-error', 'dark red', 'default'),
             ('logging-critical', 'light magenta', 'default'),
+            ('shell-input', 'light gray', 'default'),
+            ('bot-output', 'default', 'default'),
+            ('bot-output-label', 'dark cyan', 'default'),
         ]
 
     def unhandled_input(self, key):
@@ -387,7 +434,7 @@ class DywypiShell(AsyncUrwidBridge):
         # TODO no indication whether we're currently scrolled up.  scroll back
         # to bottom after x seconds with no input?
         listsize = self.widget.get_item_size(
-            self.loop.screen_size, 0, False)
+            self.urwid_loop.screen_size, 0, False)
         key = self.pane.keypress(listsize, key)
         if key:
             # `key` gets returned if it wasn't consumed
@@ -402,36 +449,79 @@ class DywypiShell(AsyncUrwidBridge):
         # TODO generalize this color thing in a way compatible with irc, html, ...
         # TODO i super duper want this for logging, showing incoming/outgoing
         # messages in the right colors, etc!!
-        self.pane.body.append(urwid.Text((color, line.rstrip())))
+        self._print_text((color, line.rstrip()))
+
+    def _print_text(self, *encoded_text):
+        self.pane.body.append(urwid.Text(list(encoded_text)))
         self.pane.set_focus(len(self.pane.body) - 1)
-        self.redraw()
+        # TODO should this just mark dirty??
+        self.urwid_loop.draw_screen()
 
     def handle_line(self, line):
         """Deal with a line of input."""
-        logger.info(line)
-
-        #from twisted.internet import defer
-        # XXX this is here cause it allows exceptions to actually be caught; be more careful with that in general
-        #defer.execute(self._handle_line, line)
+        try:
+            self._handle_line(line)
+        except Exception as e:
+            log.exception(e)
 
     def _handle_line(self, line):
+        """All the good stuff happens here.
+
+        Various things happen depending on what the line starts with.
+
+        Colon: This is a command; pretend it was sent as a private message.
+        """
+        # Whatever it was, log it
+        self.pane.body.append(urwid.Text(['>>> ', ('shell-input', line)]))
+
         if line.startswith(':'):
             command_string = line[1:]
 
-            encoding = 'utf8'
-
-            from dywypi.event import EventSource
-            class wat(object): pass
-            peer = wat()
-            peer.name = None
-            source = EventSource(self.network, peer, None)
-
-            #self.hub.run_command_string(source, command_string.decode(encoding))
+            # TODO rather we didn't need raw_message...
+            raw_message = ShellMessage(self.me.name, command_string)
+            event = Message(self, raw_message)
+            self.event_queue.put_nowait(event)
 
     def _send_message(self, target, message, as_notice=True):
         # TODO cool color
         self.add_log_line(message)
 
+    # TODO split the client interface out from the protocol?
+    def source_from_message(self, raw_message):
+        """Produce a peer of some sort from a raw message."""
+        # TODO maybe a less dumb thing
+        return self.you
+
+    @asyncio.coroutine
+    def say(self, target, message):
+        # TODO target should probably be a peer, eh
+        if target == self.you.name:
+            prefix = "bot to you: "
+        else:
+            prefix = "bot to {}: ".format(target)
+        self._print_text(('bot-output-label', prefix), ('bot-output', message))
+
+    def format_transition(self, current_style, new_style):
+        # TODO wait lol shouldn't this be converting to urwid-style tuples
+        if new_style == Style.default():
+            # Just use the reset sequence
+            return '\x1b[0m'
+
+        ansi_codes = []
+        if new_style.fg != current_style.fg:
+            ansi_codes.append(FOREGROUND_CODES[new_style.fg])
+
+        if new_style.bold != current_style.bold:
+            ansi_codes.append(BOLD_CODES[new_style.bold])
+
+        return '\x1b[' + ';'.join(ansi_codes) + 'm'
+
+
+
+# TODO this shouldn't need to exist i think
+class ShellMessage:
+    def __init__(self, *args):
+        self.args = args
 
 LOG_LEVEL_COLORS = {
     logging.DEBUG: 'logging-debug',
@@ -467,113 +557,32 @@ class DywypiShellLoggingHandler(logging.Handler):
         '''
 
 
-# TODO i want to write some nice wrappers for this i think...
-class TrivialFileTransport(asyncio.Transport):
-    """Transport that wraps two arbitrary file-likes -- which should probably
-    be normal local files, or you'd be better off using a different transport.
-    """
-
-    def __init__(self, loop, infile, outfile, protocol):
-        super().__init__()
-        self._loop = loop
-        self._infile = infile
-        self._outfile = outfile
-        self._protocol = protocol
-
-        # TODO maybe i belong elsewhere
-        from asyncio.unix_events import _set_nonblocking
-        _set_nonblocking(self._infile.fileno())
-
-        # TODO it would perhaps be possible for this to work with arbitrary
-        # file-likes, too.
-        loop.add_reader(infile, self._do_read)
-        loop.call_soon(protocol.connection_made, self)
-
-    def _do_read(self):
-        self._protocol.data_received(self._infile.read())
-
-    # ReadTransport interface
-
-    def pause_reading(self):
-        pass
-
-    def resume_reading(self):
-        pass
-
-    # WriteTransport interface
-
-    def set_write_buffer_limits(self, high=None, low=None):
-        """Set the high- and low-water limits for write flow control.
-
-        These two values control when to call the protocol's
-        pause_writing() and resume_writing() methods.  If specified,
-        the low-water limit must be less than or equal to the
-        high-water limit.  Neither value can be negative.
-
-        The defaults are implementation-specific.  If only the
-        high-water limit is given, the low-water limit defaults to a
-        implementation-specific value less than or equal to the
-        high-water limit.  Setting high to zero forces low to zero as
-        well, and causes pause_writing() to be called whenever the
-        buffer becomes non-empty.  Setting low to zero causes
-        resume_writing() to be called only once the buffer is empty.
-        Use of zero for either limit is generally sub-optimal as it
-        reduces opportunities for doing I/O and computation
-        concurrently.
-        """
-        pass
-
-    def get_write_buffer_size(self):
-        """Return the current size of the write buffer."""
-        return 0
-
-    def write(self, data):
-        """Write some data bytes to the transport.
-
-        This does not block; it buffers the data and arranges for it
-        to be sent out asynchronously.
-        """
-        # TODO this totally blocks.  but should be instant.  right?
-        self._outfile.write(data)
-        self._outfile.flush()
-
-    def write_eof(self):
-        """Closes the write end after flushing buffered data.
-
-        (This is like typing ^D into a UNIX program reading from stdin.)
-
-        Data may still be received.
-        """
-        self._outfile.close()
-
-    def can_write_eof(self):
-        """Return True if this protocol supports write_eof(), False if not."""
-        return True
-
-    def abort(self):
-        """Closes the transport immediately.
-
-        Buffered data will be lost.  No more data will be received.
-        The protocol's connection_lost() method will (eventually) be
-        called with None as its argument.
-        """
-        self._outfile.close()
-
-
 FOREGROUND_CODES = {
-    Color.black: '\x1b[30m',
-    Color.red: '\x1b[31m',
-    Color.green: '\x1b[32m',
-    Color.yellow: '\x1b[33m',
-    Color.blue: '\x1b[34m',
-    Color.purple: '\x1b[35m',
-    Color.cyan: '\x1b[36m',
-    Color.white: '\x1b[37m',
-    Color.default: '\x1b[39m',
+    Color.default: '39',
+
+    Color.black: '30',
+    Color.red: '31',
+    Color.green: '32',
+    Color.brown: '33',
+    Color.blue: '34',
+    Color.purple: '35',
+    Color.teal: '36',
+    Color.gray: '37',
+
+    # Bright colors use aixterm sequences, which are nonstandard, but work
+    # virtually everywhere in practice
+    Color.darkgray: '90',
+    Color.red: '91',
+    Color.lime: '92',
+    Color.yellow: '93',
+    Color.blue: '94',
+    Color.magenta: '95',
+    Color.cyan: '96',
+    Color.white: '97',
 }
 BOLD_CODES = {
-    Bold.on: '\x1b[1m',
-    Bold.off: '\x1b[22m',
+    Bold.on: '1',
+    Bold.off: '22',
 }
 
 
@@ -581,40 +590,35 @@ BOLD_CODES = {
 class ShellClient:
     def __init__(self, loop, network):
         self.loop = loop
+        self.network = network
 
         # TODO it would be nice to parametrize these (or even accept arbitrary
         # transports), but the event loop doesn't support async reading from
         # ttys for some reason...
-        self.stdin = sys.stdin
-        self.stdout = sys.stdout
-
-        self.event_queue = Queue(loop=loop)
+        # Note that we're using .buffer here so the underlying handles all work
+        # in bytes, just like any other socket normally would.
+        self.stdin = sys.stdin.buffer
+        self.stdout = sys.stdout.buffer.raw
 
     @asyncio.coroutine
     def connect(self):
-        self.protocol = UrwidTerminalProtocol(DywypiShell, self.loop)
-        self.transport = TrivialFileTransport(self.loop, self.stdin, self.stdout, self.protocol)
+        # TODO would be nice to intercept stdout and turn it into logging?
+
+        # TODO why do i not need this???
+        #from asyncio.unix_events import _set_nonblocking
+        #_set_nonblocking(self.stdin.fileno())
+
+        proto = DywypiShell(self.loop, self.network, writer=self.stdout)
+        _, self.protocol = yield from self.loop.connect_read_pipe(
+            lambda: proto, self.stdin)
 
     @asyncio.coroutine
     def disconnect(self):
-        self.protocol.bridge.stop()
+        self.protocol.stop()
+        # TODO close reader?  or is that the protocol's problem?
 
     @asyncio.coroutine
     def read_event(self):
         # For now, this will never ever do anything.
         # TODO this sure looks a lot like IRCClient
-        return (yield from self.event_queue.get())
-
-    def format_transition(self, current_style, new_style):
-        if new_style == Style.default():
-            # Just use the reset sequence
-            return '\x1b[0m'
-
-        ret = ''
-        if new_style.fg != current_style.fg:
-            ret += FOREGROUND_CODES[new_style.fg]
-
-        if new_style.bold != current_style.bold:
-            ret += BOLD_CODES[new_style.bold]
-
-        return ret
+        return (yield from self.protocol.event_queue.get())

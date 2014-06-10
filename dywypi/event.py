@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 
 class Event:
     """Something happened."""
+    # TODO starting to think the raw message should get far far less focus
+    # here, and instead the constructors should pull this stuff out
     def __init__(self, client, raw_message):
         self.client = client
         self.loop = client.loop
@@ -23,7 +25,7 @@ class Event:
 
     @property
     def source(self):
-       return Peer.from_prefix(self.raw_message.prefix)
+        return self.client.source_from_message(self.raw_message)
 
 
 class _MessageMixin:
@@ -35,6 +37,7 @@ class _MessageMixin:
         """Where the message was directed; either a `Channel` (for a public
         message) or a `Peer` (for a private one).
         """
+        # TODO this should absolutely be on the client wow
         target_name = self.raw_message.args[0]
         if target_name[0] in '#&!':
             return self.client.get_channel(target_name)

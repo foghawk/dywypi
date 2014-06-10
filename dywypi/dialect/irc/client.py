@@ -1,26 +1,38 @@
 import asyncio
 from asyncio.queues import Queue
+from concurrent.futures import CancelledError
 from datetime import datetime
 import getpass
+import logging
 
 from dywypi.event import Message
 from dywypi.formatting import Bold, Color, Style
 from dywypi.state import Peer
-from .protocol import IRCClientProtocol
+from .message import IRCMessage
 from .state import IRCChannel
 from .state import IRCMode
 from .state import IRCTopic
+
+log = logging.getLogger(__name__)
 
 
 FOREGROUND_CODES = {
     Color.white: '\x0300',
     Color.black: '\x0301',
-    Color.blue: '\x0302',
+    Color.navy: '\x0302',
     Color.green: '\x0303',
     Color.red: '\x0304',
-    Color.yellow: '\x0305',
+    Color.darkred: '\x0305',
     Color.purple: '\x0306',
-    Color.cyan: '\x0310',
+    Color.brown: '\x0307',  # actually orange, close enough
+    Color.yellow: '\x0308',
+    Color.lime: '\x0309',
+    Color.teal: '\x0310',
+    Color.cyan: '\x0311',
+    Color.blue: '\x0312',
+    Color.magenta: '\x0313',
+    Color.darkgray: '\x0314',
+    Color.gray: '\x0315',
 }
 
 
@@ -34,6 +46,9 @@ class IRCClient:
     def __init__(self, loop, network):
         self.loop = loop
         self.network = network
+        # TODO should this be a param?  a property of the network?  or, more
+        # likely, channel-specific and decoded separately and...
+        self.charset = 'utf8'
 
         self.joined_channels = {}  # name => Channel
 
@@ -64,7 +79,7 @@ class IRCClient:
         self._pending_topics = {}
         self._join_futures = {}
 
-        self.event_queue = Queue(loop=loop)
+        self.read_queue = Queue(loop=loop)
 
     def get_channel(self, channel_name):
         """Returns a `Channel` object containing everything the client
@@ -96,65 +111,86 @@ class IRCClient:
 
         # TODO: handle disconnection, somehow.  probably affects a lot of
         # things.
-        # TODO kind of wish this weren't here, since the creation of the
-        # connection isn't inherently part of a client.  really it should be on
-        # the...  network, perhaps?  and there's no reason i shouldn't be able
-        # to "connect" to a unix socket or pipe or anywhere else that has data.
-        _, self.proto = yield from self.loop.create_connection(
-            lambda: IRCClientProtocol(
-                self.loop, self.network.preferred_nick, password=server.password),
-            server.host, server.port, ssl=server.tls)
+        self._reader, self._writer = yield from server.connect(self.loop)
+        print('connected!')
 
-        while True:
-            yield from self._read_message()
-            # TODO this is dumb garbage; more likely this client itself should
-            # just wait for 001/RPL_WELCOME.
-            if self.proto.registered:
-                break
+        if server.password:
+            self.send_message('PASS', server.password)
+        self.send_message('NICK', self.nick)
+        self.send_message('USER', 'dywypi', '-', '-', 'dywypi Python IRC bot')
 
-        # Start the event loop as soon as we've synched, or we can't respond to
-        # anything
-        asyncio.async(self._advance(), loop=self.loop)
-
-        # Initial joins
-        yield from asyncio.gather(*[
-            self.join(channel_name)
-            for channel_name in self.network.autojoins
-        ], loop=self.loop)
+        # Start the reader loop, or we can't respond to anything
+        self._read_loop_task = asyncio.Task(self._start_read_loop())
+        asyncio.async(self._read_loop_task, loop=self.loop)
 
     @asyncio.coroutine
     def disconnect(self):
-        self.proto.send_message('QUIT', 'Seeya!')
-        self.proto.transport.close()
+        # Quit
+        self.send_message('QUIT', 'Seeya!')
+
+        # Flush the write buffer
+        yield from self._writer.drain()
+        self._writer.close()
+
+        # Stop reading events
+        self._read_loop_task.cancel()
+        # This looks a little funny since this task is already running, but we
+        # want to block until it's actually done, which might require dipping
+        # back into the event loop
+        yield from self._read_loop_task
+
+        # Read until the connection closes
+        while not self._reader.at_eof():
+            yield from self._reader.readline()
 
     @asyncio.coroutine
-    def _advance(self):
-        """Internal coroutine that just keeps the protocol message queue going.
-        Called once after a connect and should never be called again after
-        that.
+    def _start_read_loop(self):
+        """Internal coroutine that just keeps reading from the server in a
+        loop.  Called once after a connect and should never be called again
+        after that.
         """
         # TODO this is currently just to keep the message queue going, but
         # eventually it should turn them into events and stuff them in an event
         # queue
-        yield from self._read_message()
-
-        asyncio.async(self._advance(), loop=self.loop)
+        while not self._reader.at_eof():
+            try:
+                yield from self._read_message()
+            except CancelledError:
+                return
+            except Exception:
+                log.exception("Smothering exception in IRC read loop")
 
     @asyncio.coroutine
     def _read_message(self):
-        """Internal dispatcher for messages received from the protocol."""
-        message = yield from self.proto.read_message()
+        """Internal dispatcher for messages received from the server."""
+        line = yield from self._reader.readline()
+        assert line.endswith(b'\r\n')
+        line = line[:-2]
+
+        # TODO valerr, unicodeerr
+        message = IRCMessage.parse(line.decode(self.charset))
+        log.debug("recv: %r", message)
 
         # TODO there is a general ongoing problem here with matching up
         # responses.  ESPECIALLY when error codes are possible.  something here
-        # is gonna have to get a bit fancier.  maybe it should live at the
-        # protocol level, actually...?
+        # is gonna have to get a bit fancier.
 
         # Boy do I ever hate this pattern but it's slightly more maintainable
         # than a 500-line if tree.
         handler = getattr(self, '_handle_' + message.command, None)
+        event = None
         if handler:
-            handler(message)
+            event = handler(message)
+        self.read_queue.put_nowait((message, event))
+
+    def _handle_PING(self, message):
+        # PONG
+        self.send_message('PONG', message.args[-1])
+
+    def _handle_RPL_WELCOME(self, message):
+        # Initial registration: do autojoins, and any other onconnect work
+        for channel_name in self.network.autojoins:
+            asyncio.async(self.join(channel_name), loop=self.loop)
 
     def _handle_RPL_ISUPPORT(self, message):
         me, *features, human_text = message.args
@@ -298,8 +334,7 @@ class IRCClient:
                 del self._join_futures[channel_name]
 
     def _handle_PRIVMSG(self, message):
-        event = Message(self, message)
-        self.event_queue.put_nowait(event)
+        return Message(self, message)
 
     @asyncio.coroutine
     def read_event(self):
@@ -308,7 +343,8 @@ class IRCClient:
         This client does not do any kind of multiplexing or event handler
         notification; that's left to a higher level.
         """
-        return (yield from self.event_queue.get())
+        message, event = yield from self.read_queue.get()
+        return event
 
 
     # Implementations of particular commands
@@ -321,8 +357,9 @@ class IRCClient:
         `Channel` or a `Peer`.
         """
         command = 'NOTICE' if notice else 'PRIVMSG'
-        yield from self.send_message(command, target, message)
+        self.send_message(command, target, message)
 
+    @asyncio.coroutine
     def join(self, channel_name, key=None):
         """Coroutine that joins a channel, and nonblocks until the join is
         "synchronized" (defined as receiving the nick list).
@@ -332,9 +369,9 @@ class IRCClient:
 
         # TODO multiple?  error on commas?
         if key is None:
-            self.proto.send_message('JOIN', channel_name)
+            self.send_message('JOIN', channel_name)
         else:
-            self.proto.send_message('JOIN', channel_name, key)
+            self.send_message('JOIN', channel_name, key)
 
         # Clear out any lingering names list
         self._pending_names[channel_name] = []
@@ -343,9 +380,10 @@ class IRCClient:
         fut = self._join_futures[channel_name] = asyncio.Future()
         return fut
 
+    @asyncio.coroutine
     def names(self, channel_name):
         """Coroutine that returns a list of names in a channel."""
-        self.proto.send_message('NAMES', channel_name)
+        self.send_message('NAMES', channel_name)
 
         # No need to do the same thing twice
         if channel_name in self._names_futures:
@@ -360,11 +398,22 @@ class IRCClient:
 
     def set_topic(self, channel, topic):
         """Sets the channel topic."""
-        self.proto.send_message('TOPIC', channel, topic)
+        self.send_message('TOPIC', channel, topic)
 
-    @asyncio.coroutine
+    # TODO unclear whether this stuff should be separate or what; it's less
+    # about the protocol and more about the dywypi interface
     def send_message(self, command, *args):
-        self.proto.send_message(command, *args)
+        message = IRCMessage(command, *args)
+        log.debug("sent: %r", message)
+        self._writer.write(message.render().encode(self.charset) + b'\r\n')
+
+    def source_from_message(self, raw_message):
+        """Produce a peer object of some sort, representing the sender of the
+        given message.
+        """
+        # TODO this should produce the same object every time really, but atm
+        # we don't keep users or servers catalogued
+        return Peer.from_prefix(self.raw_message.prefix)
 
     def format_transition(self, current_style, new_style):
         if new_style == Style.default():
