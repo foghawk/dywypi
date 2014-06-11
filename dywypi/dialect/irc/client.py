@@ -413,7 +413,7 @@ class IRCClient:
         """
         # TODO this should produce the same object every time really, but atm
         # we don't keep users or servers catalogued
-        return Peer.from_prefix(self.raw_message.prefix)
+        return Peer.from_prefix(raw_message.prefix)
 
     def format_transition(self, current_style, new_style):
         if new_style == Style.default():

@@ -35,8 +35,6 @@ for l in LISTS:
             if tf.match(p.name):
                 safe_add(fs, p.name, p, '"{0}" collides with file "{1}" and will not be served.')
             #progress indicator?
-            #TODO write to file--better caching, allows download of list (required). reserve filename?
-            #can i load from dir, then start serving while writing? should be able to, duh async
     elif lp.is_file():
         lf = lp.open()
         for line in lf:
@@ -56,9 +54,19 @@ def and_search(terms, string):
             return False
     return True
 
+@plugin.command('write') #this shouldn't really be a command
+def write_listfiles(event):
+    for l in LISTS:
+        if Path(LISTS[l]).is_dir():
+            f = open(str(Path(LISTS[l]) / (event.client.nick + l + '.txt')), 'w')
+            for k in sorted(ls[l]):
+                f.write('!' + event.client.nick + ' ' + k + ' (' + prettysize(ls[l][k].stat().st_size) + ')\n')
+
 def prettysize(b):
-    for u in ['bytes', 'KB', 'MB', 'GB', 'TB']:
+    for u in ['bytes', 'KB', 'MB', 'GB']:
         if b < 1024.0:
+            if u == 'bytes':
+                return '{0} bytes'.format(b)
             return '{0:.2f} {1}'.format(b, u)
         b /= 1024.0
     return '{0:.2f} TB'.format(b)
@@ -77,7 +85,7 @@ def find(event):
         results = {f: ls[l][f] for f in ls[l] if and_search(event.args, unidecode(f))}
         if len(results) > 0:
             yield from event.reply("From list {0}{1}:".format(event.client.nick, l), private=True)
-            for r in results:
+            for r in sorted(results):
                 yield from event.reply("{0} ({1})".format(r, prettysize(results[r].stat().st_size)), private=True)
             found = True
     if not found and not event.channel:

@@ -141,9 +141,7 @@ class PluginManager:
         for plugin in self.loaded_plugins.values():
             if not plugin.prefix:
                 wrapped = self._wrap_event(command_event, plugin)
-                plugin.fire_command(wrapped, is_global=True)
-            wrapped = self._wrap_event(command_event, plugin)
-            futures.extend(plugin.fire_command(wrapped, is_global=True))
+                futures.extend(plugin.fire_command(wrapped, is_global=True))
         return futures
 
     def _fire_plugin_command(self, plugin_name, command_event):
@@ -161,8 +159,6 @@ class PluginManager:
     def fire(self, event):
         if isinstance(event, DirectMessage):
             log.debug("firing a direct message...")
-
-        self._fire(event)
         futures = self._fire(event)
 
         # Possibly also fire plugin-specific events.
@@ -299,14 +295,8 @@ class Plugin(BasePlugin):
             # # invoked with a prefix
             # lol nope this happens in the parser now
             #if command.is_global or not is_global:
-            asyncio.async(command.coro(event), loop=event.loop)
-
-            # Don't execute if the command is local-only and this wasn't
-            # invoked with a prefix
-            if command.is_global or not is_global:
-                futures.append(
-                    asyncio.async(command.coro(event), loop=event.loop))
-
+            futures.append(
+                asyncio.async(command.coro(event), loop=event.loop))
         return futures
 
 
