@@ -104,7 +104,7 @@ class PluginManager:
             return
         # TODO keyerror
         plugin = self.known_plugins[plugin_name]
-        plugin.start()
+        #plugin.start()
         log.info("Loaded plugin {}".format(plugin.name))
         self.loaded_plugins[plugin.name] = plugin
         if (plugin.prefix): self.loaded_prefixes[plugin.prefix] = plugin.name
@@ -125,17 +125,26 @@ class PluginManager:
         return EventWrapper(event, self.plugin_data[plugin], self)
 
     def _fire(self, event):
+        futures = []
         for plugin in self.loaded_plugins.values():
-            wrapped = self._wrap_event(event, plugin)
-            plugin.fire(wrapped)
+            futures.extend(self._fire_on(event, plugin))
+        return futures
+
+    def _fire_on(self, event, plugin):
+        wrapped = self._wrap_event(event, plugin)
+        return plugin.fire(wrapped)
 
     def _fire_global_command(self, command_event):
         # TODO well this could be slightly more efficient
         # TODO should also mention when no command exists
+        futures = []
         for plugin in self.loaded_plugins.values():
             if not plugin.prefix:
                 wrapped = self._wrap_event(command_event, plugin)
                 plugin.fire_command(wrapped, is_global=True)
+            wrapped = self._wrap_event(command_event, plugin)
+            futures.extend(plugin.fire_command(wrapped, is_global=True))
+        return futures
 
     def _fire_plugin_command(self, plugin_name, command_event):
         # TODO should DEFINITELY complain when plugin OR command doesn't exist
@@ -147,13 +156,14 @@ class PluginManager:
             #raise SomeExceptionThatGetsSentAsAReply(...)
 
         wrapped = self._wrap_event(command_event, plugin)
-        plugin.fire_command(wrapped, is_global=False)
+        return plugin.fire_command(wrapped, is_global=False)
 
     def fire(self, event):
         if isinstance(event, DirectMessage):
             log.debug("firing a direct message...")
 
         self._fire(event)
+        futures = self._fire(event)
 
         # Possibly also fire plugin-specific events.
         if isinstance(event, Message):
@@ -188,15 +198,20 @@ class PluginManager:
                 )
                 log.debug('Firing command %r', command_event)
                 if plugin_name:
-                    self._fire_plugin_command(plugin_name, command_event)
+                    futures.extend(
+                        self._fire_plugin_command(plugin_name, command_event))
                 else:
-                    self._fire_global_command(command_event)
+                    futures.extend(
+                        self._fire_global_command(command_event))
             else:
                 # Regular public message.
-                self._fire(PublicMessage.from_event(event))
+                futures.extend(
+                    self._fire(PublicMessage.from_event(event)))
 
             # TODO: what about private messages that don't "look like"
             # commands?  what about "all" public messages?  etc?
+
+        return futures
 
 
 class PluginCommand:
@@ -253,14 +268,31 @@ class Plugin(BasePlugin):
             return coro
         return decorator
 
+    ### "Real" methods
+
     def fire(self, event):
-        # OK actually fire the event.
+        """Fire the given event, by dumping all the associated listeners on
+        this plugin into the event loop.
+
+        Returns a sequence of Futures, one for each listener (and possibly
+        zero).  Event handlers aren't expected to have any particular result,
+        but the caller might be interested in one for particular event types,
+        or may wish to handle exceptions.
+        """
+        futures = []
         for listener in self.listeners[event.type]:
             # Fire them all off in parallel via async(); `yield from` would run
             # them all in serial and nonblock until they're all done!
-            asyncio.async(listener(event), loop=event.loop)
+            # TODO if there are exceptions here they're basically lost; whoever
+            # asked for the event will never get an error message, and e.g.
+            # py.test will never get a traceback
+            futures.append(asyncio.async(listener(event), loop=event.loop))
+        return futures
 
     def fire_command(self, event, *, is_global):
+        """Fire a command event.  Return a sequence of Futures.  See `fire`.
+        """
+        futures = []
         if event.command_name in self.commands:
             command = self.commands[event.command_name]
             # # Don't execute if the command is local-only and this wasn't
@@ -269,9 +301,13 @@ class Plugin(BasePlugin):
             #if command.is_global or not is_global:
             asyncio.async(command.coro(event), loop=event.loop)
 
-    def start(self):
-        # TODO need an onload hook or something?
-        pass
+            # Don't execute if the command is local-only and this wasn't
+            # invoked with a prefix
+            if command.is_global or not is_global:
+                futures.append(
+                    asyncio.async(command.coro(event), loop=event.loop))
+
+        return futures
 
 
 class PluginError(Exception): pass
