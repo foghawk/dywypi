@@ -1,51 +1,13 @@
 import asyncio
 from asyncio.queues import Queue
+from concurrent.futures import CancelledError
 from dywypi.event import DirectMessage
 import logging
+
+import socket
 import re
 
 logger = logging.getLogger(__name__)
-
-class DCCClientProtocol(asyncio.Protocol):
-    def __init__(self, loop, charset='utf8'):
-        self.charset = charset
-
-        self.buf = b''
-        self.message_queue = Queue(loop=loop)
-        self.registered = False
-
-    def connection_made(self, transport):
-        self.transport = transport
-
-    def data_received(self, data):
-        data = self.buf + data
-        while True:
-            split = re.split(b'\r?\n?', data, maxsplit=1)
-            raw_message = split[0]
-            data = b''
-            if len(split) == 1:
-                # Incomplete message; stop here and wait for more
-                self.buf = raw_message
-                return
-            data = split[1]
-
-            # TODO valerr
-            message = DCCMessage.parse(raw_message.decode(self.charset))
-            logger.debug("recv: %r", message)
-            self.handle_message(message)
-
-    def handle_message(self, message):
-        self.message_queue.put_nowait(message)
-
-    def send_message(self, message):
-        message = DCCMessage(message)
-        logger.debug("sent: %r", message)
-        self.transport.write(message.render().encode(self.charset) + b'\r\n')
-
-    @asyncio.coroutine
-    def read_message(self):
-        return (yield from self.message_queue.get())
-
 
 class DCCMessage:
     def __init__(self, message):
@@ -70,47 +32,97 @@ class DCCMessage:
 
 
 class DCCClient:
-    def __init__(self, loop, network):
+    def __init__(self, loop, network, send=False):
         self.loop = loop
         self.network = network
-        self.event_queue = Queue(loop=loop)
+        self.read_queue = Queue(loop=loop)
+        self.send = send #ugh what if i want to RECEIVE though.
+        #not sure what the use case would be but...?
 
     @asyncio.coroutine
-    def connect(self):
-        server = self.current_server = self.network.servers[0]
-        _, self.proto = yield from self.loop.create_connection(
-            lambda: DCCClientProtocol(self.loop), server.host, server.port)
+    def connect(self, port=None):
+        if not self.send:
+            server = self.current_server = self.network.servers[0]
+            self._reader, self._writer = yield from server.connect(self.loop)
+            self._read_loop_task = asyncio.Task(self._start_read_loop())
+            asyncio.async(self._read_loop_task, loop=self.loop)
+        else:
+            self._waiting = asyncio.Lock()
+            yield from self._waiting.acquire()
+            if port:
+                self.network = yield from asyncio.start_server(self._handle_client,
+                    host=socket.gethostbyname(socket.gethostname()), port=port, loop=self.loop)
+            else:
+                logger.error("No port provided for send")
 
-        #check for connection? how tho
+    @asyncio.coroutine
+    def _handle_client(self, client_reader, client_writer):
+        self._reader = client_reader
+        self._writer = client_writer
+        self._waiting.release()
+        self._read_loop_task = asyncio.Task(self._start_read_loop())
+        asyncio.async(self._read_loop_task, loop=self.loop)
 
-        asyncio.async(self._advance(), loop=self.loop)
-
+    @asyncio.coroutine
     def disconnect(self):
-        self.proto.transport.close()
+        yield from self._writer.drain()
+        self._writer.write_eof()
+
+        self._read_loop_task.cancel()
+        yield from self._read_loop_task
+
+        while not self._reader.at_eof():
+            yield from self._reader.readline()
+
+        if self.send:
+            self._waiting.release()
+            self.network.close()
 
     @asyncio.coroutine
-    def _advance(self):
-        logger.debug('advancing...') #yes
-        yield from self._read_message()
-        asyncio.async(self._advance(), loop=self.loop)
+    def _start_read_loop(self):
+        if not self.send: #acks don't really do anything so don't listen for them
+            while not self._reader.at_eof():
+                try:
+                    yield from self._read_message()
+                except CancelledError:
+                    return
+                except Exception:
+                    logger.exception("Smothering exception in DCC read loop")
 
     @asyncio.coroutine
     def _read_message(self):
-         logger.debug('reading message...') #yes
-         message = yield from self.proto.read_message()
+         line = yield from self._reader.readline()
+         m = re.match(b'(.*)(\r|\n|\r\n)$', line)
+         assert m
+         line = m.group(1)
+         message = DCCMessage.parse(line)
+         logger.debug("recv: %r", message)
          event = DirectMessage(self, message)
-         self.event_queue.put_nowait(event)
-         logger.debug(self.event_queue)
+         self.read_queue.put_nowait((message, event))
 
     @asyncio.coroutine
     def read_event(self):
-        logger.debug('reading an event...') #no
-        return (yield from self.event_queue.get())
+        message, event = yield from self.read_queue.get()
+        return event
 
     @asyncio.coroutine
     def say(self, message, target=None, no_respond=None):
-        yield from self.send_message(message)
+        self.send_message(message)
 
     @asyncio.coroutine
     def send_message(self, message):
-        self.proto.send_message(message)
+        message = DCCMessage(message)
+        logger.debug("sent: %r", message)
+        self._writer.write(message.render().encode('utf8') + b'\r\n')
+
+    @asyncio.coroutine
+    def transfer(self, path):
+        yield from self._waiting.acquire()
+        f = open(str(path), 'rb')
+        block = b'\x01'
+        while block != b'':
+            block = f.read(1024)
+            self._writer.write(block)
+        f.close()
+        self._waiting.release()
+        return True

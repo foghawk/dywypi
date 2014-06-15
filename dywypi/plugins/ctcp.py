@@ -67,6 +67,24 @@ def dcc(event):
             yield from event.reply("Sorry, it looks like I can't open a direct chat connection. "+
                 "This could be because of settings on your IRC client, firewall, router, and/or proxy.")
 
+def transfer(event, path, port):
+    if not path.is_file():
+        logger.error("Path supplied is not a file!")
+        return
+    dcc_client = DCCClient(event.loop, None, send=True)
+    yield from dcc_client.connect(port)
+    ip = int(ipaddress.ip_address(event.client.network.hostname))
+    yield from event.reply("\x01DCC SEND {0} {1} {2} {3}\x01".format(path.name, ip, port, path.stat().st_size), private=True)
+    completed = False
+    try:
+        completed = yield from dcc_client.transfer(path)
+        yield from dcc_client.disconnect()
+    except ConnectionResetError:
+        if completed:
+            return #Some clients auto-disconnect
+        else:
+            raise
+
 @plugin.on(DirectMessage)
 def dcc_echo(event):
     logger.debug("got a direct message!") #no

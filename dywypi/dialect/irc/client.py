@@ -112,7 +112,7 @@ class IRCClient:
         # TODO: handle disconnection, somehow.  probably affects a lot of
         # things.
         self._reader, self._writer = yield from server.connect(self.loop)
-        print('connected!')
+        log.debug('connected!')
 
         if server.password:
             self.send_message('PASS', server.password)
@@ -189,6 +189,7 @@ class IRCClient:
 
     def _handle_RPL_WELCOME(self, message):
         # Initial registration: do autojoins, and any other onconnect work
+        self.network.hostname = message.args[1].rsplit(sep='@')[-1]
         for channel_name in self.network.autojoins:
             asyncio.async(self.join(channel_name), loop=self.loop)
 

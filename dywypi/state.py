@@ -12,6 +12,7 @@ class Network:
     """
     def __init__(self, name):
         self.name = name
+        self.hostname = '0.0.0.0'
         self.nicks = []
         self.servers = []
         self.autojoins = []

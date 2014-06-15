@@ -199,7 +199,7 @@ class PluginManager:
                 else:
                     futures.extend(
                         self._fire_global_command(command_event))
-            else:
+            if is_public:
                 # Regular public message.
                 futures.extend(
                     self._fire(PublicMessage.from_event(event)))
