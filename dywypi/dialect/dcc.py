@@ -2,10 +2,10 @@ import asyncio
 from asyncio.queues import Queue
 from concurrent.futures import CancelledError
 from dywypi.event import DirectMessage
-import logging
 
 import socket
 import re
+import logging
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,6 @@ class DCCClient:
             yield from self._reader.readline()
 
         if self.send:
-            self._waiting.release()
             self.network.close()
 
     @asyncio.coroutine

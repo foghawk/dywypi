@@ -105,7 +105,6 @@ def find(event):
 @plugin.on(PublicMessage)
 def send(event):
     nick = event.client.nick
-    logger.debug(event.message)
 
     if event.message.startswith('!'+nick):
         try:
