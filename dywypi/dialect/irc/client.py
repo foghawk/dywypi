@@ -1,11 +1,13 @@
 import asyncio
 from asyncio.queues import Queue
+from collections import OrderedDict
 from concurrent.futures import CancelledError
 from datetime import datetime
+from datetime import timedelta
 import getpass
 import logging
 
-from dywypi.event import Message
+from dywypi.event import PublicMessage, PrivateMessage
 from dywypi.formatting import Bold, Color, Style
 from dywypi.state import Peer
 from .message import IRCMessage
@@ -34,6 +36,12 @@ FOREGROUND_CODES = {
     Color.darkgray: '\x0314',
     Color.gray: '\x0315',
 }
+
+
+class IRCError(Exception):
+    @property
+    def message(self):
+        return self.args[0]
 
 
 class IRCClient:
@@ -78,6 +86,8 @@ class IRCClient:
         self._names_futures = {}
         self._pending_topics = {}
         self._join_futures = {}
+
+        self._message_waiters = OrderedDict()
 
         self.read_queue = Queue(loop=loop)
 
@@ -161,6 +171,21 @@ class IRCClient:
                 log.exception("Smothering exception in IRC read loop")
 
     @asyncio.coroutine
+    def gather_messages(self, *middle, end, errors=()):
+        fut = asyncio.Future()
+        messages = {}
+        for command in middle:
+            messages[command] = 'middle'
+        for command in end:
+            messages[command] = 'end'
+        for command in errors:
+            messages[command] = 'error'
+        collected = []
+        self._message_waiters[fut] = (messages, collected)
+        yield from fut
+        return collected
+
+    @asyncio.coroutine
     def _read_message(self):
         """Internal dispatcher for messages received from the server."""
         line = yield from self._reader.readline()
@@ -174,6 +199,33 @@ class IRCClient:
         # TODO there is a general ongoing problem here with matching up
         # responses.  ESPECIALLY when error codes are possible.  something here
         # is gonna have to get a bit fancier.
+
+        for fut, (waiting_on, collected) in self._message_waiters.items():
+            # TODO this needs to handle error codes too, or the future will
+            # linger forever!  potential problem: if the server is lagging
+            # behind us, an error code might actually map to a privmsg we tried
+            # to send (which has no success response) and we'll get all fucked
+            # up.  i don't know if there's any way to solve this.
+            # TODO hey stupid question: after we've seen ANY of the waited-on
+            # messages, should we pipe all subsequent messages into that future
+            # until we see the one that's supposed to end it?  something like
+            # a forced JOIN could screw up a join attempt, for example, but if
+            # we're getting RPL_TOPIC when we didn't actually ask for the
+            # topic, THEN we know we're definitely in the join sequence.
+            # TODO also given normal irc response flow, i'm pretty sure we
+            # should only ever need to check the first pending future.  there's
+            # no way we should need to skip around.
+            # TODO maybe give these a timeout so a bad one doesn't fuck us up
+            # forever
+            if message.command in waiting_on:
+                collected.append(message)
+                if waiting_on[message.command] == 'end':
+                    fut.set_result(collected)
+                    del self._message_waiters[fut]
+                elif waiting_on[message.command] == 'error':
+                    fut.set_exception(IRCError(message))
+                    del self._message_waiters[fut]
+                break
 
         # Boy do I ever hate this pattern but it's slightly more maintainable
         # than a 500-line if tree.
@@ -335,7 +387,20 @@ class IRCClient:
                 del self._join_futures[channel_name]
 
     def _handle_PRIVMSG(self, message):
-        return Message(self, message)
+        # PRIVMSG target :text
+        target_name, text = message.args
+
+        source = Peer.from_prefix(message.prefix)
+
+        if target_name[0] in self.channel_types:
+            target = self.get_channel(target_name)
+            cls = PublicMessage
+        else:
+            # TODO this is /us/, so, surely ought to be known
+            target = Peer(target_name, None, None)
+            cls = PrivateMessage
+
+        return cls(source, target, text, client=self, raw=message)
 
     @asyncio.coroutine
     def read_event(self):
@@ -350,8 +415,60 @@ class IRCClient:
 
     # Implementations of particular commands
 
-    # TODO should this be part of the general client interface, or should there
-    # be a separate thing that smooths out the details?
+    # TODO should these be part of the general client interface, or should
+    # there be a separate thing that smooths out the details?
+    @asyncio.coroutine
+    def whois(self, target):
+        """Coroutine that queries for information about a target."""
+        self.send_message('WHOIS', target)
+        messages = yield from self.gather_messages(
+            'RPL_WHOISUSER',
+            'RPL_WHOISSERVER',
+            'RPL_WHOISOPERATOR',
+            'RPL_WHOISIDLE',
+            'RPL_WHOISCHANNELS',
+            'RPL_WHOISVIRT',
+            'RPL_WHOIS_HIDDEN',
+            'RPL_WHOISSPECIAL',
+            'RPL_WHOISSECURE',
+            'RPL_WHOISSTAFF',
+            'RPL_WHOISLANGUAGE',
+            end=[
+                'RPL_ENDOFWHOIS',
+            ],
+            errors=[
+                'ERR_NOSUCHSERVER',
+                'ERR_NONICKNAMEGIVEN',
+                'ERR_NOSUCHNICK',
+            ],
+        )
+
+        # nb: The first two args for all the responses are our nick and the
+        # target's nick.
+        # TODO apparently you can whois multiple nicks at a time
+        for message in messages:
+            if message.command == 'RPL_WHOISUSER':
+                ident, hostname
+                ident = message.args[2]
+                hostname = message.args[3]
+                # args[4] is a literal *
+                realname = message.args[5]
+            elif message.command == 'RPL_WHOISIDLE':
+                # Idle time.  Some servers (at least, inspircd) also have
+                # signon time as unixtime.
+                idle = timedelta(seconds=int(message.args[2]))
+            elif message.command == 'RPL_WHOISCHANNELS':
+                # TODO split and parse out the usermodes
+                # TODO don't some servers have an extension with multiple modes
+                # here
+                channels = message.args[2]
+            elif message.command == 'RPL_WHOISSERVER':
+                server = message.args[2]
+                server_desc = message.args[3]
+
+
+        return messages
+
     @asyncio.coroutine
     def say(self, message, target, notice=False):
         """Coroutine that sends a message to a target, which may be either a
@@ -407,14 +524,6 @@ class IRCClient:
         message = IRCMessage(command, *args)
         log.debug("sent: %r", message)
         self._writer.write(message.render().encode(self.charset) + b'\r\n')
-
-    def source_from_message(self, raw_message):
-        """Produce a peer object of some sort, representing the sender of the
-        given message.
-        """
-        # TODO this should produce the same object every time really, but atm
-        # we don't keep users or servers catalogued
-        return Peer.from_prefix(raw_message.prefix)
 
     def format_transition(self, current_style, new_style):
         if new_style == Style.default():

@@ -11,59 +11,52 @@ logger = logging.getLogger(__name__)
 
 class Event:
     """Something happened."""
-    # TODO starting to think the raw message should get far far less focus
-    # here, and instead the constructors should pull this stuff out
-    def __init__(self, client, raw_message):
+    def __init__(self, *, client, raw=None):
         self.client = client
         self.loop = client.loop
-        self.raw_message = raw_message
+        self.raw_message = raw
         if isinstance(self, DirectMessage): logger.debug('direct message is now an event...') #yes
 
-    @classmethod
-    def from_event(cls, event, *args, **kwargs):
-        return cls(event.client, event.raw_message, *args, **kwargs)
+class Message(Event):
+    """Base class for sending text somewhere our client can see it.
 
-    @property
-    def source(self):
-        return self.client.source_from_message(self.raw_message)
-
-
-class _MessageMixin:
-    """Provides some common accesors used by both the regular `Message` event
-    and some special specific plugin events.
+    This class will never be fired directly; only a more specific subclass.
+    But you can always listen on this class directly to hear all possible
+    messages.
     """
-    @property
-    def target(self):
-        """Where the message was directed; either a `Channel` (for a public
-        message) or a `Peer` (for a private one).
-        """
-        # TODO this should absolutely be on the client wow
-        target_name = self.raw_message.args[0]
-        if target_name[0] in '#&!':
-            return self.client.get_channel(target_name)
-        else:
-            # TODO this too but less urgent
-            # TODO this is actually /us/, so.
-            return Peer(target_name, None, None)
+    def __init__(self, source, target, message, **kwargs):
+        super().__init__(**kwargs)
+
+        self.source = source
+        self.target = target
+        self.message = message
 
     @property
     def channel(self):
-        """Channel where the message occurred, or None if this was a private
-        message.
+        """Channel to which the message was sent.  This is populated only for
+        public messages.
         """
-        target = self.target
-        # TODO lol this is so hacky; give them is_* accessors plz
-        if isinstance(target, Peer):
-            return None
+        # This makes me unhappy, but putting it on PublicMessage means it
+        # doesn't work for CommandEvent  :/
+        if isinstance(self.target, Channel):
+            return self.target
         else:
-            return target
+            return None
 
-    @property
-    def message(self):
-        return self.raw_message.args[1]
+class PublicMessage(Message):
+    """A public message, i.e. one sent to a channel.
 
-class Message(Event, _MessageMixin):
-    pass
+    Any public message addressed directly to the bot will become a
+    `CommandMessage` instead, so this event only fires for other forms of
+    chatter.  Listen to the `Message` parent class to receive events for all
+    messages, whether commands or not.
+    """
+
+
+class PrivateMessage(Message):
+    """A private message.  Note that bot plugins will never receive this, as
+    all private messages are currently assumed to be commands.
+    """
 
 
 class DirectMessage(Event):
@@ -74,3 +67,4 @@ class DirectMessage(Event):
     @property
     def message(self):
         return self.raw_message
+

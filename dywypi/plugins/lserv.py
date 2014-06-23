@@ -1,4 +1,4 @@
-from dywypi.plugin import Plugin, PublicMessage
+from dywypi.plugin import Plugin, Message
 
 import re
 from pathlib import Path
@@ -125,7 +125,7 @@ def find(event):
 def get_port():
     return random.randint(*PORT_RANGE)
 
-@plugin.on(PublicMessage)
+@plugin.on(Message)
 def send(event):
     nick = event.client.nick
 
